@@ -29,15 +29,23 @@ class Utils():
     def __init__(self,
     X_data_path,
     Y_data_path,
+    X_test_path,
+    Y_test_path,
     batch_size = 32, vocab_lim=10000):
         self.X_data_path = X_data_path
         self.X_line_num = int(os.popen("wc -l %s"%self.X_data_path).read().split(' ')[0])
         self.Y_data_path = Y_data_path
-        self.Y_line_num = int(os.popen("wc -l %s"%self.Y_data_path).read().split(' ')[0])
+        self.Y_line_num = int(os.popen("wc -l %s" % self.Y_data_path).read().split(' ')[0])
+        
+        self.X_test_path = X_test_path
+        self.X_test_num = int(os.popen("wc -l %s"%self.X_test_path).read().split(' ')[0])
+        self.Y_test_path = Y_test_path
+        self.Y_test_num = int(os.popen("wc -l %s" % self.Y_test_path).read().split(' ')[0])
+        
         self.idx2word, self.word2idx, self.emb_mat = load_embedding(limit=vocab_lim)
         self.batch_size = batch_size
         self.train_step_num = math.floor(self.X_line_num / batch_size)
-        self.test_step_num = math.floor(self.Y_line_num / batch_size)
+        self.test_step_num = math.floor(self.X_test_num / batch_size)
         self.device = "cuda:0"
         self.ch_gex = re.compile(r'[\u4e00-\u9fff]+')
         self.eng_gex = re.compile(r'[a-zA-Z0-9０１２３４５６７８９\s]+')
@@ -73,9 +81,25 @@ class Utils():
 
     def data_generator(self, mode="X", write_actual_data=False):
         path = eval("self.%s_data_path" % mode)
-        file = open(path)
-        sents = []
         while True:
+            file = open(path)
+            sents = []
+            for sent in file:
+                if len(sent.strip()) == 0:
+                    continue
+                word_list = self.process_sent(sent)
+                sents.append(word_list)
+                if len(sents) == self.batch_size:
+                    yield sents
+                    sents = []
+            if len(sents)!=0:
+                yield sents
+
+    def test_generator(self, mode="X", write_actual_data=False):
+        path = eval("self.%s_test_path" % mode)
+        while True:
+            file = open(path)
+            sents = []
             for sent in file:
                 if len(sent.strip()) == 0:
                     continue

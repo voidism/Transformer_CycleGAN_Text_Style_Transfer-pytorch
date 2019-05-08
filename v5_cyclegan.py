@@ -8,7 +8,7 @@ import os, re, sys
 from jexus import Clock
 from attn import Transformer, LabelSmoothing, \
 data_gen, NoamOpt, Generator, SimpleLossCompute, \
-greedy_decode, subsequent_mask
+greedy_decode, subsequent_mask, Batch
 from utils import Utils
 from char_cnn_discriminator import Discriminator
 import argparse
@@ -72,6 +72,21 @@ def reconstruct(model, src, max_len, start_symbol=2):
         ret_back = torch.cat([ret_back, back.unsqueeze(1)], dim=1)
     return ret_back
 
+def wgan_pg(netD, fake_data, real_data, lamb=10):
+    batch_size = fake_data.shape[0]
+    ## 1. interpolation
+    alpha = torch.rand(batch_size, 1, 1).expand(real_data.size()).to(device)
+    interpolates = alpha * real_data + ((1 - alpha) * fake_data)
+    interpolates = Variable(interpolates.to(device), requires_grad=True)
+    ## 2. gradient penalty
+    disc_interpolates = netD(interpolates).view(batch_size, )
+    gradients = torch.autograd.grad(outputs=disc_interpolates, inputs=interpolates,
+                              grad_outputs=torch.ones(disc_interpolates.size()).to(device),
+                              create_graph=True, retain_graph=True, only_inputs=True)[0]
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * lamb
+    ## 3. append it to loss function
+    return gradient_penalty
+
 class CycleGAN(nn.Module):
     def __init__(self, discriminator, generator, utils, embedder):
         super(CycleGAN, self).__init__()
@@ -123,28 +138,31 @@ class CycleGAN(nn.Module):
                 # if epoch == 0:
                 #     break
                 self.D.zero_grad()
+                d_real_data = self.embed(Y_data.src.to(device)).float()
         
                 #  1A: Train D on real
-                d_real_pred = self.D(self.embed(Y_data.src.to(device)))
-                d_real_error = self.criterion(d_real_pred, torch.ones((d_real_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # ones = true
+                d_real_pred = self.D(d_real_data)
+                # d_real_error = self.criterion(d_real_pred, torch.ones((d_real_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # ones = true
 
                 #  1B: Train D on fake
-                d_fake_pred = self.D(self.embed(X_data.src.to(device)))
-                d_fake_error = self.criterion(d_fake_pred, torch.zeros((d_fake_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # zeros = fake
-                (d_fake_error + d_real_error).backward()
+                d_fake_data = self.embed(X_data.src.to(device)).float()
+                d_fake_pred = self.D(d_fake_data)
+                # d_fake_error = self.criterion(d_fake_pred, torch.zeros((d_fake_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # zeros = fake
+                # (d_fake_error + d_real_error).backward()
+
+                d_loss = d_fake_pred.mean() - d_real_pred.mean()
+                d_loss += wgan_pg(self.D, d_fake_data, d_real_data, lamb=10)
+                d_loss.backward()
                 self.D_opt.step()     # Only optimizes D's parameters; changes based on stored gradients from backward()
-                d_ct.flush(info={"D_loss": d_fake_error.item()})
+                d_ct.flush(info={"D_loss": d_loss.item()})
         torch.save(self.D.state_dict(), "model_disc_pretrain.ckpt")
 
-    def train_model(self, num_epochs=100, d_steps=20, g_steps=80, g_scale=1.0, r_scale=1.0):
-        # self.D.to(self.D.device)
-        # self.G.to(self.G.device)
-        # self.R.to(self.R.device)
-        for i, batch in enumerate(data_gen(utils.data_generator("X"), utils.sents2idx)):
+    def train_model(self, num_epochs=100, d_steps=20, g_steps=20, g_scale=1.0, r_scale=1000.0):
+        for i, batch in enumerate(data_gen(self.utils.test_generator("X"), self.utils.sents2idx)):
             X_test_batch = batch
             break
 
-        for i, batch in enumerate(data_gen(utils.data_generator("Y"), utils.sents2idx)):
+        for i, batch in enumerate(data_gen(self.utils.test_generator("Y"), self.utils.sents2idx)):
             Y_test_batch = batch
             break
         X_datagen = self.utils.data_generator("X")
@@ -159,17 +177,22 @@ class CycleGAN(nn.Module):
                     self.D.zero_grad()
             
                     #  1A: Train D on real
-                    d_real_pred = self.D(self.embed(Y_data.src.to(device)))
-                    d_real_error = self.criterion(d_real_pred, torch.ones((d_real_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # ones = true
+                    d_real_data = self.embed(Y_data.src.to(device)).float()
+                    d_real_pred = self.D(d_real_data)
+                    # d_real_error = self.criterion(d_real_pred, torch.ones((d_real_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # ones = true
 
                     #  1B: Train D on fake
                     self.G.to(device)
                     d_fake_data = backward_decode(self.G, self.embed, X_data.src, X_data.src_mask, max_len=self.utils.max_len, return_term=0).detach()  # detach to avoid training G on these labels
                     d_fake_pred = self.D(d_fake_data)
-                    d_fake_error = self.criterion(d_fake_pred, torch.zeros((d_fake_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # zeros = fake
-                    (d_fake_error + d_real_error).backward()
+                    # d_fake_error = self.criterion(d_fake_pred, torch.zeros((d_fake_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # zeros = fake
+                    # (d_fake_error + d_real_error).backward()
+
+                    d_loss = d_fake_pred.mean() - d_real_pred.mean()
+                    d_loss += wgan_pg(self.D, d_fake_data, d_real_data, lamb=10)
+                    d_loss.backward()
                     self.D_opt.step()     # Only optimizes D's parameters; changes based on stored gradients from backward()
-                    d_ct.flush(info={"D_loss":d_fake_error.item()})
+                    d_ct.flush(info={"D_loss":d_loss.item()})
 
             g_ct = Clock(g_steps, title="Train Generator(%d/%d)"%(epoch, num_epochs))
             r_ct = Clock(g_steps, title="Train Reconstructor(%d/%d)" % (epoch, num_epochs))
@@ -179,18 +202,19 @@ class CycleGAN(nn.Module):
                     self.G.zero_grad()
                     g_fake_data = backward_decode(self.G, self.embed, X_data.src, X_data.src_mask, max_len=self.utils.max_len, return_term=0)
                     dg_fake_pred = self.D(g_fake_data)
-                    g_error = self.criterion(dg_fake_pred, torch.ones((dg_fake_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # we want to fool, so pretend it's all genuine
-            
-                    g_error.backward(retain_graph=True)
+                    # g_error = self.criterion(dg_fake_pred, torch.ones((dg_fake_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # we want to fool, so pretend it's all genuine
+                    g_loss = -dg_fake_pred.mean()
+
+                    g_loss.backward(retain_graph=True)
                     self.G_opt.step()  # Only optimizes G's parameters
                     self.G.zero_grad()
-                    g_ct.flush(info={"G_loss": g_error.item()})
+                    # g_ct.flush(info={"G_loss": g_loss.item()})
 
                     # 3. reconstructor  643988636173-69t5i8ehelccbq85o3esu11jgh61j8u5.apps.googleusercontent.com
                     # way_3
                     out = self.R.forward(g_fake_data, embedding_layer(X_data.trg.to(device)), 
                         None, X_data.trg_mask)
-                    r_loss = self.r_loss_compute(out, X_data.trg_y, X_data.ntokens)
+                    r_loss = r_scale*self.r_loss_compute(out, X_data.trg_y, X_data.ntokens)
                     # way_2
                     # r_reco_data = prob_backward(self.R, self.embed, g_fake_data, None, max_len=self.utils.max_len, raw=True)
                     # x_orgi_data = X_data.src[:, 1:]
@@ -200,8 +224,8 @@ class CycleGAN(nn.Module):
                     # r_error = r_scale*self.cosloss(r_reco_data.float().view(-1, self.embed.weight.shape[1]), x_orgi_data.float().view(-1, self.embed.weight.shape[1]), torch.ones(viewed_num, dtype=torch.float32).to(device))
                     self.G_opt.step()
                     self.G_opt.optimizer.zero_grad()
-                    r_ct.flush(info={"G_loss": g_error.item(),
-                    "R_loss": r_loss / X_data.ntokens.float().to(device)})
+                    r_ct.flush(info={"G": g_loss.item(),
+                    "R": r_loss / X_data.ntokens.float().to(device)})
                 
             with torch.no_grad():
                 x_cont, x_ys = backward_decode(model, self.embed, X_test_batch.src, X_test_batch.src_mask, max_len=25, start_symbol=2)
@@ -215,22 +239,42 @@ class CycleGAN(nn.Module):
                     print("===")
                     k = utils.idx2sent([i])[0]
                     print("ORG:", " ".join(k[:k.index('<eos>')+1]))
-                    print("--")
                     print("GEN:", " ".join(j[:j.index('<eos>')+1] if '<eos>' in j else j))
-                    print("--")
                     print("REC:", " ".join(l[:l.index('<eos>')+1] if '<eos>' in l else l))
-                    print("===")
                 print("=====")
                 for i, j, l in zip(Y_test_batch.src, y, r_y):
                     print("===")
                     k = utils.idx2sent([i])[0]
                     print("ORG:", " ".join(k[:k.index('<eos>')+1]))
-                    print("--")
                     print("GEN:", " ".join(j[:j.index('<eos>')+1] if '<eos>' in j else j))
-                    print("--")
                     print("REC:", " ".join(l[:l.index('<eos>')+1] if '<eos>' in l else l))
-                    print("===")
-            # self.save_model()
+            self.save_model()
+
+    def demo(self, sent):
+        sent = sent.strip()
+        data = torch.from_numpy(self.utils.sents2idx([self.utils.process_sent(sent)])).long()
+        data = torch.cat((torch.full((data.shape[0], 1), 2, dtype=torch.long), data), dim=1)
+        src = Variable(data, requires_grad=False)
+        tgt = Variable(data, requires_grad=False)
+        batch = Batch(src, tgt, 0)
+        with torch.no_grad():
+            x_cont, x_ys = backward_decode(model, self.embed, batch.src, batch.src_mask, max_len=25, start_symbol=2)
+            x = utils.idx2sent(x_ys)
+            r_x = utils.idx2sent(backward_decode(self.R, self.embed, x_cont, None, max_len=self.utils.max_len, raw=True, return_term=1))
+
+            for i,j,l in zip(batch.src, x, r_x):
+                print("===")
+                k = utils.idx2sent([i])[0]
+                print("ORG:", " ".join(k[:k.index('<eos>')+1]))
+                print("GEN:", " ".join(j[:j.index('<eos>')+1] if '<eos>' in j else j))
+                print("REC:", " ".join(l[:l.index('<eos>')+1] if '<eos>' in l else l))
+            print("=====")
+
+    def live(self):
+        while True:
+            e = input("sent> ")
+            self.demo(e)
+            
 
 def pretrain_run_epoch(data_iter, model, loss_compute, train_step_num, embedding_layer):
     "Standard Training and Logging Function"
@@ -320,15 +364,20 @@ if __name__ == "__main__":
     parser.add_argument("-model_name", default="model.ckpt", required=False, help="test filename")
     parser.add_argument("-disc_name", default="cnn_disc/model_disc_pretrain_xy_inv.ckpt", required=False, help="test filename")
     parser.add_argument("-save_path", default="", required=False, help="test filename")
-    parser.add_argument("-X_file", default="big_cna.txt", required=False, help="X domain text filename")
-    parser.add_argument("-Y_file", default="big_cou.txt", required=False, help="Y domain text filename")
+    parser.add_argument("-X_file", default="shuf_cna.txt", required=False, help="X domain text filename")
+    parser.add_argument("-Y_file", default="shuf_cou.txt", required=False, help="Y domain text filename")
+    parser.add_argument("-X_test", default="test.cna", required=False, help="X domain text filename")
+    parser.add_argument("-Y_test", default="test.cou", required=False, help="Y domain text filename")
     parser.add_argument("-epoch", default=1, required=False, help="test filename")
     parser.add_argument("-max_len", default=20, required=False, help="test filename")
     parser.add_argument("-batch_size", default=32, required=False, help="batch size")
+    parser.add_argument("-r_scale", default=10, required=False, help="batch size")
     args = parser.parse_args()
 
     model = Transformer(N=2)
-    utils = Utils(X_data_path=args.X_file, Y_data_path=args.Y_file, batch_size=int(args.batch_size))
+    utils = Utils(X_data_path=args.X_file, Y_data_path=args.Y_file,
+    X_test_path=args.X_test, Y_test_path=args.Y_test,
+    batch_size=int(args.batch_size))
     embedding_layer = get_embedding_layer(utils).to(device)
     model.generator = Generator(d_model = utils.emb_mat.shape[1], vocab=utils.emb_mat.shape[0])
     if args.load_model:
@@ -339,8 +388,14 @@ if __name__ == "__main__":
         disc = Discriminator(word_dim=utils.emb_mat.shape[1], inner_dim=512, seq_len=20)
         main_model = CycleGAN(disc, model, utils, embedding_layer)
         main_model.to(device)
-        main_model.load_model(g_file="model_pretrain.ckpt", r_file="model_pretrain.ckpt", d_file=args.disc_name)
-        main_model.train_model()
+        main_model.load_model(g_file="model_pretrain.ckpt", r_file="model_pretrain.ckpt", d_file="model_disc_pretrain.ckpt")
+        main_model.train_model(num_epochs=int(args.epoch), r_scale=int(args.r_scale))
+    if args.mode == "demo":
+        disc = Discriminator(word_dim=utils.emb_mat.shape[1], inner_dim=512, seq_len=20)
+        main_model = CycleGAN(disc, model, utils, embedding_layer)
+        main_model.to(device)
+        main_model.load_model(g_file="Gen_model.ckpt", r_file="Res_model.ckpt", d_file="Dis_model.ckpt")
+        main_model.live()
     if args.mode == "disc":
         disc = Discriminator(word_dim=utils.emb_mat.shape[1], inner_dim=512, seq_len=20)
         main_model = CycleGAN(disc, model, utils, embedding_layer)
@@ -363,7 +418,6 @@ if __name__ == "__main__":
         for i, batch in enumerate(data_gen(utils.data_generator("Y"), utils.sents2idx)):
             Y_test_batch = batch
             break
-
     # if args.load_model:
     #     model.load_model(filename=args.model_name)
     # if args.mode == "train":

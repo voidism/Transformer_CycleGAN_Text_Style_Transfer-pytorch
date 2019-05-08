@@ -7,7 +7,7 @@ from torch.autograd import Variable
 import os, re, sys
 from jexus import Clock
 global device
-device = "cuda:0"
+device = "cuda:1"
 
 class EncoderDecoder(nn.Module):
     """

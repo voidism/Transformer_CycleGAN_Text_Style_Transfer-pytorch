@@ -10,11 +10,10 @@ from attn import Transformer, LabelSmoothing, \
 data_gen, NoamOpt, Generator, SimpleLossCompute, \
 greedy_decode, subsequent_mask
 from utils import Utils
-from char_cnn_discriminator import Discriminator
+from transformer_discriminator import Discriminator
 import argparse
 
-device = "cuda:1"
-
+device = "cuda:0"
 
 def prob_backward(model, embed, src, src_mask, max_len, start_symbol=2, raw=False):
     if raw==False:
@@ -102,11 +101,11 @@ class CycleGAN(nn.Module):
 
     def load_model(self, path="", g_file=None, d_file=None, r_file=None):
         if g_file!=None:
-            self.G.load_state_dict(torch.load(os.path.join(path, g_file), map_location=device))
+            self.G.load_state_dict(torch.load(os.path.join(path, g_file)))
         if d_file!=None:
-            self.D.load_state_dict(torch.load(os.path.join(path, d_file), map_location=device))
+            self.D.load_state_dict(torch.load(os.path.join(path, d_file)))
         if r_file!=None:
-            self.R.load_state_dict(torch.load(os.path.join(path, r_file), map_location=device))
+            self.R.load_state_dict(torch.load(os.path.join(path, r_file)))
         print("model loaded!")
 
     def pretrain_disc(self, num_epochs=100):
@@ -126,17 +125,17 @@ class CycleGAN(nn.Module):
         
                 #  1A: Train D on real
                 d_real_pred = self.D(self.embed(Y_data.src.to(device)))
-                d_real_error = self.criterion(d_real_pred, torch.ones((d_real_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # ones = true
+                d_real_error = self.criterion(d_real_pred, torch.ones((d_real_pred.shape[0],), dtype=torch.int64).to(device))  # ones = true
 
                 #  1B: Train D on fake
                 d_fake_pred = self.D(self.embed(X_data.src.to(device)))
-                d_fake_error = self.criterion(d_fake_pred, torch.zeros((d_fake_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # zeros = fake
+                d_fake_error = self.criterion(d_fake_pred, torch.zeros((d_fake_pred.shape[0],), dtype=torch.int64).to(device))  # zeros = fake
                 (d_fake_error + d_real_error).backward()
                 self.D_opt.step()     # Only optimizes D's parameters; changes based on stored gradients from backward()
                 d_ct.flush(info={"D_loss": d_fake_error.item()})
         torch.save(self.D.state_dict(), "model_disc_pretrain.ckpt")
 
-    def train_model(self, num_epochs=100, d_steps=20, g_steps=80, g_scale=1.0, r_scale=1.0):
+    def train_model(self, num_epochs=100, d_steps=20, g_steps=80, g_scale=1.0, r_scale=1.0, main_device="cuda:0", sec_device="cuda:1"):
         # self.D.to(self.D.device)
         # self.G.to(self.G.device)
         # self.R.to(self.R.device)
@@ -160,13 +159,13 @@ class CycleGAN(nn.Module):
             
                     #  1A: Train D on real
                     d_real_pred = self.D(self.embed(Y_data.src.to(device)))
-                    d_real_error = self.criterion(d_real_pred, torch.ones((d_real_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # ones = true
+                    d_real_error = self.criterion(d_real_pred, torch.ones((d_real_pred.shape[0],), dtype=torch.int64).to(device))  # ones = true
 
                     #  1B: Train D on fake
-                    self.G.to(device)
+                    self.G.to(main_device)
                     d_fake_data = backward_decode(self.G, self.embed, X_data.src, X_data.src_mask, max_len=self.utils.max_len, return_term=0).detach()  # detach to avoid training G on these labels
                     d_fake_pred = self.D(d_fake_data)
-                    d_fake_error = self.criterion(d_fake_pred, torch.zeros((d_fake_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # zeros = fake
+                    d_fake_error = self.criterion(d_fake_pred, torch.zeros((d_fake_pred.shape[0],), dtype=torch.int64).to(device))  # zeros = fake
                     (d_fake_error + d_real_error).backward()
                     self.D_opt.step()     # Only optimizes D's parameters; changes based on stored gradients from backward()
                     d_ct.flush(info={"D_loss":d_fake_error.item()})
@@ -179,7 +178,7 @@ class CycleGAN(nn.Module):
                     self.G.zero_grad()
                     g_fake_data = backward_decode(self.G, self.embed, X_data.src, X_data.src_mask, max_len=self.utils.max_len, return_term=0)
                     dg_fake_pred = self.D(g_fake_data)
-                    g_error = self.criterion(dg_fake_pred, torch.ones((dg_fake_pred.shape[0],), dtype=torch.int64).to(self.D.device))  # we want to fool, so pretend it's all genuine
+                    g_error = self.criterion(dg_fake_pred, torch.ones((dg_fake_pred.shape[0],), dtype=torch.int64).to(device))  # we want to fool, so pretend it's all genuine
             
                     g_error.backward(retain_graph=True)
                     self.G_opt.step()  # Only optimizes G's parameters
@@ -318,17 +317,15 @@ if __name__ == "__main__":
     parser.add_argument("-filename", default=None, required=False, help="test filename")
     parser.add_argument("-load_model", default=False, required=False, help="test filename")
     parser.add_argument("-model_name", default="model.ckpt", required=False, help="test filename")
-    parser.add_argument("-disc_name", default="cnn_disc/model_disc_pretrain_xy_inv.ckpt", required=False, help="test filename")
     parser.add_argument("-save_path", default="", required=False, help="test filename")
-    parser.add_argument("-X_file", default="big_cna.txt", required=False, help="X domain text filename")
-    parser.add_argument("-Y_file", default="big_cou.txt", required=False, help="Y domain text filename")
+    parser.add_argument("-train_file", default=None, required=False, help="test filename")
+    parser.add_argument("-test_file", default=None, required=False, help="test filename")
     parser.add_argument("-epoch", default=1, required=False, help="test filename")
     parser.add_argument("-max_len", default=20, required=False, help="test filename")
-    parser.add_argument("-batch_size", default=32, required=False, help="batch size")
     args = parser.parse_args()
 
     model = Transformer(N=2)
-    utils = Utils(X_data_path=args.X_file, Y_data_path=args.Y_file, batch_size=int(args.batch_size))
+    utils = Utils(X_data_path="big_cna.txt", Y_data_path="big_cou.txt")
     embedding_layer = get_embedding_layer(utils).to(device)
     model.generator = Generator(d_model = utils.emb_mat.shape[1], vocab=utils.emb_mat.shape[0])
     if args.load_model:
@@ -336,16 +333,16 @@ if __name__ == "__main__":
     if args.mode == "pretrain":
         pretrain(model, embedding_layer, utils, int(args.epoch))
     if args.mode == "cycle":
-        disc = Discriminator(word_dim=utils.emb_mat.shape[1], inner_dim=512, seq_len=20)
+        disc = Discriminator(word_dim=utils.emb_mat.shape[1], inner_dim=2048, seq_len=20)
         main_model = CycleGAN(disc, model, utils, embedding_layer)
         main_model.to(device)
-        main_model.load_model(g_file="model_pretrain.ckpt", r_file="model_pretrain.ckpt", d_file=args.disc_name)
+        main_model.load_model(g_file="model_pretrain.ckpt", r_file="model_pretrain.ckpt", d_file="model_disc_pretrain.ckpt")
         main_model.train_model()
     if args.mode == "disc":
-        disc = Discriminator(word_dim=utils.emb_mat.shape[1], inner_dim=512, seq_len=20)
+        disc = Discriminator(word_dim=utils.emb_mat.shape[1], inner_dim=2048, seq_len=20)
         main_model = CycleGAN(disc, model, utils, embedding_layer)
         main_model.to(device)
-        main_model.pretrain_disc(2)
+        main_model.pretrain_disc()
 
     if args.mode == "dev":
         model = Transformer(N=2)

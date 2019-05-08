@@ -34,7 +34,7 @@ class Resblock(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, word_dim, inner_dim, seq_len, kernel_size=3, device="cuda:0"):
+    def __init__(self, word_dim, inner_dim, seq_len, kernel_size=3, device="cuda:0", two_out=False):
         super(Discriminator, self).__init__()
         self.device = device
         self.word_dim = word_dim
@@ -52,7 +52,7 @@ class Discriminator(nn.Module):
         self.fc_1 = nn.Linear(W, int(W/8))
         self.fc_2 = nn.Linear(int(W/8), int(W/32))
         self.fc_3 = nn.Linear(int(W/32), int(W/64))
-        self.fc_4 = nn.Linear(int(W / 64), 2)
+        self.fc_4 = nn.Linear(int(W / 64), 2 if two_out else 1)
         self.relu = nn.LeakyReLU()
         
     def feed_fc(self, inputs):
